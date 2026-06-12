@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Matplotlib cache
+.matplotlib-cache/
+
+# Logs and ephemeral state
+logs/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets (defensive — none found here, but for the future)
+.env
+.env.*
+*.key
+*.pem
+
+# Embedding extractions — regenerable from analyses/extract.py
+outputs/
+
+# Pre-migration plot archive (use the dated folders instead)
+experiments/_canonical_archive/
+
+# Large binary artifacts (kernels, parquet, model checkpoints)
+*.safetensors
+*.npz
+*.parquet
+*.bin
+*.pt
+*.pth
+*.ckpt

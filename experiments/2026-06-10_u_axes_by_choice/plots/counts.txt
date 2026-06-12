@@ -1,0 +1,6 @@
+=== Qwen2.5-0.5B-Instruct ===
+total: 272
+pragmatic (both chose I)                : 15
+literal (both chose P_U)                : 31
+primacy (always Oración 1)              : 185
+recency (always Oración 2)              : 41

@@ -1,0 +1,14 @@
+# Heavy deps for local hidden-state extraction. Install into a dedicated venv
+# (keep the qualitative_analysis plotting env light):
+#   python -m venv representational_analysis/.venv
+#   representational_analysis/.venv/bin/pip install -r representational_analysis/requirements.txt
+torch
+transformers>=4.46
+accelerate
+safetensors
+sentencepiece
+numpy
+pandas
+pyarrow
+matplotlib
+openpyxl

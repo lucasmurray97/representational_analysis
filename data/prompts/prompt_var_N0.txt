@@ -1,0 +1,19 @@
+Recibirás la siguiente entrada:
+
+
+Una Pregunta
+Una Respuesta a esa pregunta
+Una Oración de referencia
+
+Tu tarea es determinar que tan relacionado está el mensaje que queria transmitir la respuesta con la Oración.
+
+Entrada:
+
+Pregunta:
+{question}
+
+Respuesta:
+{answer}
+
+Oración:
+{sentence_1}

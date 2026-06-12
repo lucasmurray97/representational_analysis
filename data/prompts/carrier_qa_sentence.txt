@@ -1,0 +1,10 @@
+Entrada:
+
+Pregunta:
+{question}
+
+Respuesta:
+{answer}
+
+Oración:
+{sentence}

@@ -1,0 +1,34 @@
+Recibirás la siguiente entrada:
+
+
+Una Pregunta
+Una Respuesta a esa pregunta
+Dos oraciones de referencia: Oración 1 y Oración 2
+
+Tu tarea es determinar si el mensaje que quería transmitir la respuesta está más relacionado con la Oración 1 o con la Oración 2.
+Debes devolver un único número entero según la siguiente escala:
+
+0 = La respuesta está más relacionada con la Oración 1
+1 = La respuesta está más relacionada con la Oración 2
+
+Reglas importantes:
+
+Devuelve únicamente un solo número: 0 o 1
+No entregues explicaciones, razonamientos ni texto adicional
+
+
+Entrada:
+
+Pregunta:
+{question}
+
+Respuesta:
+{answer}
+
+Oración 1:
+{sentence_1}
+
+Oración 2:
+{sentence_2}
+
+Salida:
