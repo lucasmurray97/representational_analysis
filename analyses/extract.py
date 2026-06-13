@@ -77,6 +77,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bracket-pooling", nargs="+", default=["mean"], choices=BRACKET_POOLINGS,
                    help="How to pool each bracket span. 'mean' = mean over the span; "
                         "'last' = the final token of the span. Pass both to save both.")
+    p.add_argument("--bertscore-pairs", nargs="+", default=None,
+                   help="Compute cross-layer BERTScore F1 between bracket spans, per stimulus. "
+                        "'auto' = all C(K,2) pairs of --brackets; or list pairs A:B C:D. "
+                        "Saved as bertscore_pairs.safetensors with keys '<A>__<B>__F1' of shape "
+                        "[N, L_A, L_B]. Default: disabled.")
+    p.add_argument("--bertscore-no-idf", action="store_true",
+                   help="Disable IDF weighting in BERTScore (default: IDF on, per BERTScore paper).")
+    p.add_argument("--bertscore-save-pr", action="store_true",
+                   help="Also save the asymmetric Precision and Recall components (~3x storage).")
     p.add_argument("--raw", action="store_true", help="Skip the chat template (tokenize the prompt as-is).")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp32"])
@@ -226,13 +235,38 @@ def run_pass(
     bracket_cnt = {f: [] for f in bracket_fields}
     tok_index_rows, meta_rows = [], []
 
-    # BERTScore pooling needs IDF per (bracket field, token id), computed over the bracket
-    # spans of the entire run. We tokenize each prompt once, collect the unique token ids
-    # falling inside each bracket span, then form a per-vocab lookup tensor we can index by
-    # input_ids in the main loop.
+    # ---- BERTScore pair selection ----
+    # Parse --bertscore-pairs into a list of (A, B) field tuples; default to nothing.
+    bs_pairs: list[tuple[str, str]] = []
+    if args.bertscore_pairs:
+        if not bracket_on:
+            raise SystemExit("--bertscore-pairs requires --brackets.")
+        if args.bertscore_pairs == ["auto"]:
+            bs_pairs = [(a, b) for i, a in enumerate(bracket_fields)
+                        for b in bracket_fields[i + 1:]]
+        else:
+            for spec in args.bertscore_pairs:
+                if ":" not in spec:
+                    raise SystemExit(f"--bertscore-pairs entry {spec!r} must be 'auto' or 'A:B'.")
+                a, b = spec.split(":", 1)
+                if a not in bracket_fields or b not in bracket_fields:
+                    raise SystemExit(f"--bertscore-pairs {spec}: both {a} and {b} must appear "
+                                     f"in --brackets ({bracket_fields}).")
+                bs_pairs.append((a, b))
+        print(f"BERTScore pairs: {bs_pairs}  (IDF={'off' if args.bertscore_no_idf else 'on'}, "
+              f"save_PR={args.bertscore_save_pr})", flush=True)
+
+    bs_acc_F1 = {pair: [] for pair in bs_pairs}
+    bs_acc_P = {pair: [] for pair in bs_pairs} if args.bertscore_save_pr else None
+    bs_acc_R = {pair: [] for pair in bs_pairs} if args.bertscore_save_pr else None
+
+    # ---- IDF computation ----
+    # Used by both 'bertscore' bracket pooling AND BERTScore-pairs (unless --bertscore-no-idf).
+    # Computed once via a tokenizer pass over all prompts; per-field.
     idf_lookup: dict[str, "torch.Tensor"] = {}
-    if "bertscore" in bracket_modes and bracket_on:
-        print("Computing IDF for bertscore pooling (one tokenizer pass) ...", flush=True)
+    need_idf = ("bertscore" in bracket_modes) or (bs_pairs and not args.bertscore_no_idf)
+    if need_idf and bracket_on:
+        print("Computing IDF for BERTScore (one tokenizer pass) ...", flush=True)
         N = len(items)
         df_per_field: dict[str, dict[int, int]] = {f: {} for f in bracket_fields}
         for (text, sp) in finals:
@@ -313,6 +347,10 @@ def run_pass(
 
         if bracket_on:
             nonspecial = ~((offsets[:, :, 0] == 0) & (offsets[:, :, 1] == 0))
+            # Precompute all bracket fmasks once per batch; both bracket pooling and
+            # BERTScore-pair F1 need them, and we want to slice across two fields at a time.
+            field_fmask: dict[str, "torch.Tensor"] = {}
+            field_cnt: dict[str, "torch.Tensor"] = {}
             for field in bracket_fields:
                 fmask = torch.zeros(B, T, dtype=torch.bool, device=device)
                 for b in range(B):
@@ -321,7 +359,12 @@ def run_pass(
                         o = offsets[b]
                         fmask[b] = (o[:, 1] > s) & (o[:, 0] < e)
                 fmask &= attn.bool() & nonspecial
-                cnt = fmask.sum(dim=1)
+                field_fmask[field] = fmask
+                field_cnt[field] = fmask.sum(dim=1)
+
+            for field in bracket_fields:
+                fmask = field_fmask[field]
+                cnt = field_cnt[field]
                 hs_dtype = hs[layers[0]].dtype
                 if "mean" in bracket_modes:
                     fm = fmask.unsqueeze(-1).to(hs_dtype)
@@ -351,6 +394,58 @@ def run_pass(
                         vB[cnt == 0] = float("nan")
                         bracket_acc["bertscore"][field][l].append(to_np(vB))
                 bracket_cnt[field].extend(cnt.tolist())
+
+            # ---- BERTScore cross-layer F1 ----
+            # For each pair (A, B) and each stimulus in the batch, build the L_A × L_B
+            # matrix where M[i, j] = F1(A's token vectors at layer i, B's token vectors at layer j).
+            # Stored per stimulus so analyses can subset (e.g. by model choice) later.
+            if bs_pairs:
+                L_count = len(layers)
+                # Pre-normalize hidden states for cosine (in fp32 for numerical stability).
+                hs_norm = []
+                for l in layers:
+                    h32 = hs[l].to(torch.float32)
+                    hs_norm.append(h32 / h32.norm(dim=-1, keepdim=True).clamp(min=1e-8))
+                hs_norm_stack = torch.stack(hs_norm, dim=0)  # [L, B, T, d]
+                idf_on = need_idf and not args.bertscore_no_idf
+                for (A, B_field) in bs_pairs:
+                    cnt_A = field_cnt[A]
+                    cnt_B = field_cnt[B_field]
+                    for stim in range(B):
+                        nA, nB = int(cnt_A[stim]), int(cnt_B[stim])
+                        if nA == 0 or nB == 0:
+                            nan_lxl = np.full((L_count, L_count), np.nan, dtype=np.float16)
+                            bs_acc_F1[(A, B_field)].append(nan_lxl)
+                            if args.bertscore_save_pr:
+                                bs_acc_P[(A, B_field)].append(nan_lxl)
+                                bs_acc_R[(A, B_field)].append(nan_lxl)
+                            continue
+                        a_pos = field_fmask[A][stim].nonzero(as_tuple=True)[0]
+                        b_pos = field_fmask[B_field][stim].nonzero(as_tuple=True)[0]
+                        # Slice tokens at all layers: [L, n, d]
+                        A_tok = hs_norm_stack[:, stim, a_pos, :]
+                        B_tok = hs_norm_stack[:, stim, b_pos, :]
+                        # Cross-layer cosine cube: [L_A, L_B, n_A, n_B].
+                        S = torch.einsum("iad,jbd->ijab", A_tok, B_tok)
+                        if idf_on:
+                            w_A = idf_lookup[A][input_ids[stim, a_pos]].to(S.dtype)
+                            w_B = idf_lookup[B_field][input_ids[stim, b_pos]].to(S.dtype)
+                            if w_A.sum() == 0:
+                                w_A = torch.ones_like(w_A)
+                            if w_B.sum() == 0:
+                                w_B = torch.ones_like(w_B)
+                            R_t = (S.max(dim=3).values * w_A).sum(dim=2) / w_A.sum()
+                            P_t = (S.max(dim=2).values * w_B).sum(dim=2) / w_B.sum()
+                        else:
+                            R_t = S.max(dim=3).values.mean(dim=2)
+                            P_t = S.max(dim=2).values.mean(dim=2)
+                        F1_t = 2 * P_t * R_t / (P_t + R_t).clamp(min=1e-8)
+                        bs_acc_F1[(A, B_field)].append(F1_t.to(torch.float16).cpu().numpy())
+                        if args.bertscore_save_pr:
+                            bs_acc_P[(A, B_field)].append(P_t.to(torch.float16).cpu().numpy())
+                            bs_acc_R[(A, B_field)].append(R_t.to(torch.float16).cpu().numpy())
+                # Free the stacked normalized states before next batch.
+                del hs_norm, hs_norm_stack
 
         if not args.no_answer:
             logits_last = out.logits[:, -1, :]
@@ -402,8 +497,31 @@ def run_pass(
         "transformers": transformers.__version__, "torch": torch.__version__,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if bs_pairs:
+        manifest["bertscore"] = {
+            "pairs": [[a, b] for a, b in bs_pairs],
+            "layers": layers,
+            "idf": (need_idf and not args.bertscore_no_idf),
+            "save_pr": args.bertscore_save_pr,
+        }
     embeddings_io.save_run(run_dir, pooled=pooled_final, metadata=metadata_df, manifest=manifest,
                            tokens_all=tokens_all_final, tokens_index=tokens_index_df)
+
+    # BERTScore pairs: separate safetensors file with [N, L_A, L_B] per pair.
+    if bs_pairs:
+        from safetensors.numpy import save_file as save_st
+        bs_tensors: dict[str, np.ndarray] = {}
+        for pair in bs_pairs:
+            a, b = pair
+            bs_tensors[f"{a}__{b}__F1"] = np.stack(bs_acc_F1[pair], axis=0)
+            if args.bertscore_save_pr:
+                bs_tensors[f"{a}__{b}__P"] = np.stack(bs_acc_P[pair], axis=0)
+                bs_tensors[f"{a}__{b}__R"] = np.stack(bs_acc_R[pair], axis=0)
+        bs_path = run_dir / "bertscore_pairs.safetensors"
+        save_st({k: np.ascontiguousarray(v) for k, v in bs_tensors.items()}, str(bs_path))
+        print(f"  bertscore_pairs.safetensors: {len(bs_pairs)} pairs × "
+              f"{'F1+P+R' if args.bertscore_save_pr else 'F1 only'}, "
+              f"{next(iter(bs_tensors.values())).shape} per key (fp16)")
 
     print(f"\nWrote {run_dir}")
     for name, d in pooled_final.items():

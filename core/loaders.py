@@ -114,6 +114,29 @@ def load_triplet(
     raise ValueError(f"unknown kind {kind!r}")
 
 
+def load_bertscore_pair(run: Path, a: str, b: str, *, mode: str = "F1") -> np.ndarray:
+    """Load the cross-layer BERTScore tensor for the bracket pair (a, b).
+
+    Returns an array of shape [N, L_a, L_b] (per stimulus, per A-layer, per B-layer).
+    mode: 'F1' (default), 'P', or 'R'. P/R are only available if --bertscore-save-pr
+    was passed to analyses.extract.
+
+    Raises FileNotFoundError if bertscore_pairs.safetensors doesn't exist in `run`;
+    KeyError if the (a, b) pair wasn't computed (try (b, a) too — pairs are stored
+    in the order they were specified).
+    """
+    from safetensors.numpy import load_file
+    path = Path(run) / "bertscore_pairs.safetensors"
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found. Did you pass --bertscore-pairs to extract?")
+    data = load_file(str(path))
+    key = f"{a}__{b}__{mode}"
+    if key not in data:
+        avail = sorted({k.rsplit("__", 1)[0] for k in data.keys()})
+        raise KeyError(f"{key} not in {path.name}. Available pairs: {avail}")
+    return data[key]
+
+
 def load_contrast_quad(fwd: Path, rev: Path, layer: int):
     """Return the four sentence views + Q/A + per-run final tokens at one layer.
 
