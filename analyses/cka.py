@@ -43,6 +43,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--slot", default=None, help="Sentence-slot bracket name (carrier runs).")
     p.add_argument("--bracket-pooling", choices=["mean", "last", "bertscore"], default="mean",
                    help="Span pooling: 'mean' / 'last' / 'bertscore' (IDF-weighted mean).")
+    p.add_argument("--carrier-cols", nargs="+", default=None,
+                   help="Carrier runs only: which sentence_col values to split the slot bracket "
+                        "into, in order (default: 'PU I'). E.g. --carrier-cols PU I CT lets you "
+                        "see the paraphrase, inference, and a control side by side.")
     p.add_argument("--rename", nargs="+", default=[],
                    help='Rename brackets in labels, e.g. "sentence_1=P_U sentence_2=I".')
     p.add_argument("--output", default=None)
@@ -70,16 +74,27 @@ def main() -> None:
     sfx = _bracket_suffix(args.bracket_pooling)
 
     if carrier:
-        i_s4, i_p = carrier_indices(meta)
-        N = len(i_s4)
-        RENAME = {"question": "Q", "answer": "U"}
+        carrier_cols = args.carrier_cols or ["PU", "I"]
+        idx_by_col = carrier_indices(meta, carrier_cols)
+        first_col = carrier_cols[0]
+        N = len(idx_by_col[first_col])
+        # Backwards-compat display rename: old prompts used generic placeholders that we
+        # relabel in plot legends. New prompts using column names directly come through
+        # unchanged unless --rename is passed.
+        RENAME = {"question": "Q", "answer": "U", "QUD": "Q", "U": "U",
+                  "PU": "P_U"}  # PU column name → P_U label
+        # Display label for each carrier sentence-col: PU -> P_U, I -> I, CT -> CT, ...
+        CARRIER_DISPLAY = {"PU": "P_U"}
         KEYS = []
         for b in brackets_in_manifest:
             if b == sentence_slot:
-                KEYS.append(("P_U", f"bracket_{b}", i_s4))
-                KEYS.append(("I",   f"bracket_{b}", i_p))
+                # One row per carrier column: that column's fill becomes its own bracket.
+                for col in carrier_cols:
+                    KEYS.append((CARRIER_DISPLAY.get(col, col), f"bracket_{b}", idx_by_col[col]))
             else:
-                KEYS.append((RENAME.get(b, b), f"bracket_{b}", i_s4))
+                # Non-slot brackets (Q, U, ...) — identical across all carrier columns by
+                # the causal mask, so pick the first column's rows for indexing.
+                KEYS.append((RENAME.get(b, b), f"bracket_{b}", idx_by_col[first_col]))
     else:
         N = len(meta)
         idx = np.arange(N)

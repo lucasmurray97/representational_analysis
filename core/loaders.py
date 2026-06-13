@@ -34,20 +34,50 @@ def _bracket_suffix(pooling: str) -> str:
         )
 
 
-def carrier_indices(meta: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """For an N0 carrier run, return (i_s4, i_p) — row indices for the S4 fill and P fill."""
-    s4_pos, p_pos = {}, {}
+def carrier_indices(meta: pd.DataFrame, columns: list[str] | None = None) -> dict[str, np.ndarray]:
+    """For an N0 carrier run, return {column_name: row_indices} for each requested column.
+
+    Indices are aligned: a stimulus row is included only if it has an entry for EVERY
+    requested column. Default columns are ('PU', 'I') — the paraphrase / inference pair
+    used by the standard semantic-vs-pragmatic analyses; override to pick any subset of
+    the carrier sentences (PU, I, CT, CT2, CT3, CT4, NR — or whatever your run used).
+
+    `prompt_id` is expected to look like "<row>:<column>" as written by stimuli.build_carrier_items.
+    """
+    if columns is None:
+        columns = ["PU", "I"]
+    pos: dict[str, dict[int, int]] = {c: {} for c in columns}
     for i, pid in enumerate(meta["prompt_id"]):
         r, c = pid.split(":")
-        (s4_pos if c == "S4" else p_pos)[int(r)] = i
-    rows = sorted(set(s4_pos) & set(p_pos))
-    return np.array([s4_pos[r] for r in rows]), np.array([p_pos[r] for r in rows])
+        if c in pos:
+            pos[c][int(r)] = i
+    if not pos or not all(pos.values()):
+        missing = [c for c, p in pos.items() if not p]
+        raise ValueError(
+            f"carrier_indices: no rows for column(s) {missing}; "
+            f"sentence_col values present: {sorted({pid.split(':')[1] for pid in meta['prompt_id']})}"
+        )
+    rows = sorted(set.intersection(*(set(p) for p in pos.values())))
+    return {c: np.array([pos[c][r] for r in rows]) for c in columns}
 
 
-def load_triplet(run: Path, layer: int, kind: str, pooling: str = "mean"):
+def load_triplet(
+    run: Path,
+    layer: int,
+    kind: str,
+    pooling: str = "mean",
+    *,
+    answer_bracket: str = "answer",
+    para_col: str = "PU",
+    infer_col: str = "I",
+):
     """Return (U, P_U, I, N) at one layer. All N×d, aligned across rows.
 
-    kind == 'carrier'  : P_U/I differ by ROW (S4 vs P fill); brackets are answer + sentence_slot.
+    kind == 'carrier'  : P_U/I differ by ROW; brackets are <answer_bracket> + sentence_slot.
+                         para_col / infer_col are the sentence_col values to split on
+                         (defaults: "PU" vs "I"). U is read off the para_col rows
+                         (U is identical across both rows under the causal mask, but we
+                         need to pick one for indexing).
     kind == 'p5_fwd'   : sentence_1 = P_U, sentence_2 = I.
     kind == 'p5_rev'   : sentence_1 = I,   sentence_2 = P_U.
     """
@@ -57,17 +87,28 @@ def load_triplet(run: Path, layer: int, kind: str, pooling: str = "mean"):
 
     if kind == "carrier":
         slot = manifest.get("sentence_slot") or "sentence_1"
-        i_s4, i_p = carrier_indices(meta)
-        U = io.load_layer(run, layer, "bracket_answer" + sfx)[0].astype(np.float32)[i_s4]
-        PU = io.load_layer(run, layer, f"bracket_{slot}" + sfx)[0].astype(np.float32)[i_s4]
-        I = io.load_layer(run, layer, f"bracket_{slot}" + sfx)[0].astype(np.float32)[i_p]
-        return U, PU, I, len(i_s4)
+        idx = carrier_indices(meta, [para_col, infer_col])
+        i_para, i_infer = idx[para_col], idx[infer_col]
+        U = io.load_layer(run, layer, f"bracket_{answer_bracket}" + sfx)[0].astype(np.float32)[i_para]
+        PU = io.load_layer(run, layer, f"bracket_{slot}" + sfx)[0].astype(np.float32)[i_para]
+        I = io.load_layer(run, layer, f"bracket_{slot}" + sfx)[0].astype(np.float32)[i_infer]
+        return U, PU, I, len(i_para)
 
     if kind in ("p5_fwd", "p5_rev"):
-        U = io.load_layer(run, layer, "bracket_answer" + sfx)[0].astype(np.float32)
+        U = io.load_layer(run, layer, f"bracket_{answer_bracket}" + sfx)[0].astype(np.float32)
         S1 = io.load_layer(run, layer, "bracket_sentence_1" + sfx)[0].astype(np.float32)
         S2 = io.load_layer(run, layer, "bracket_sentence_2" + sfx)[0].astype(np.float32)
         PU, I = (S1, S2) if kind == "p5_fwd" else (S2, S1)
+        return U, PU, I, U.shape[0]
+
+    if kind == "direct":
+        # Prompts with column-name placeholders ({U}, {PU}, {I}, ...). Bracket names
+        # follow the placeholder names → bracket_<colname>. Position info is in the
+        # prompt text, not in the bracket name; the fwd/rev pair from extract's
+        # --counterbalance preserves this invariant.
+        U  = io.load_layer(run, layer, f"bracket_{answer_bracket}" + sfx)[0].astype(np.float32)
+        PU = io.load_layer(run, layer, f"bracket_{para_col}"       + sfx)[0].astype(np.float32)
+        I  = io.load_layer(run, layer, f"bracket_{infer_col}"      + sfx)[0].astype(np.float32)
         return U, PU, I, U.shape[0]
 
     raise ValueError(f"unknown kind {kind!r}")

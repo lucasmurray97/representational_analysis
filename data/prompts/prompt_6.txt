@@ -5,7 +5,7 @@ Una Pregunta
 Una Respuesta a esa pregunta
 Dos oraciones de referencia: Oración 1 y Oración 2
 
-Tu tarea es determinar si el mensaje que quería transmitir la respuesta está más relacionado con la Oración 1 o con la Oración 2.
+Tu tarea es determinar si la respuesta está más relacionada con la Oración 1 o con la Oración 2.
 Debes devolver un único número entero según la siguiente escala:
 
 0 = La respuesta está más relacionada con la Oración 1

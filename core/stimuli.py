@@ -18,17 +18,22 @@ import pandas as pd
 
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_]\w*)\}")
 
-# Semantic placeholder -> stimulus column (forward order: S4 = Oración 1, P = Oración 2).
+# Backwards-compat field map for older prompts that use generic placeholder names
+# ({question}, {answer}, {sentence_1}, {sentence_2}). NEW prompts can — and should —
+# use column names from items_completo.xlsx directly as placeholders (e.g. {QUD}, {U},
+# {PU}, {I}, {CT}, {CT2}, {CT3}, {CT4}, {NR}). Direct column names resolve via the
+# exact-column-name fallback in resolve_columns; this map is only consulted first.
 DEFAULT_FIELD_MAP = {
     "question": "QUD",
-    "answer": "S2",
-    "sentence_1": "S4",
-    "sentence_2": "P",
+    "answer": "U",
+    "sentence_1": "PU",
+    "sentence_2": "I",
 }
 
-# Candidate reference sentences for the carrier slot when --sentences all is given
-# (the answer S2 and the question QUD are excluded; they are the fixed context).
-DEFAULT_SENTENCE_POOL = ["S1", "S3", "S4", "P"]
+# Candidate sentence columns for the carrier {sentence} slot when --sentences all is
+# given. Mirrors items_completo.xlsx; QUD and U are excluded (they are the fixed
+# question/answer frame). Override with `--sentences <names>` to pick any subset.
+DEFAULT_SENTENCE_POOL = ["PU", "I", "CT", "CT2", "CT3", "CT4", "NR"]
 
 
 def find_placeholders(template: str) -> list[str]:

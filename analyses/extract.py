@@ -5,15 +5,22 @@ Prompt sources:
   --template FILE  a prompt template with {placeholders}; values are pulled per row
                    from --stimuli (an .xlsx), tracking each bracket's char span.
 
+Counterbalanced two-sentence prompts:
+  --counterbalance A B  Run the extraction twice in one invocation (single model load).
+                        The first pass uses the template as-is and writes to
+                        outputs/<model>/<set_name>_fwd/. The second pass swaps the
+                        {A} and {B} placeholders in the prompt text and writes to
+                        outputs/<model>/<set_name>_rev/. Bracket names follow the
+                        original placeholder names; the swap only changes their
+                        position in the prompt. Use for counterbalancing semantic
+                        candidate sentences (e.g. --counterbalance I PU).
+
 Pooling (per layer):
   --pooling whole      mean over all prompt tokens
             last       the last (answer-position) token, padding-safe
             all        every token (ragged -> flat [sum_tokens, d] + token index)
   --brackets all|F...  per-bracket span pooling (mean over each field's tokens);
                        requires --template and a fast tokenizer.
-
-For each prompt it also records the model's next-token answer (argmax of the last
--position logits). Results are saved via core.io.save_run.
 """
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import hashlib
 import json
+import tempfile
 import time
 
 import numpy as np
@@ -50,13 +58,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompts", default=None, help=".txt (one per line) or .jsonl ({id,text}).")
     p.add_argument("--prompt", action="append", default=[], help="Inline prompt; repeatable.")
     p.add_argument("--template", default=None, help="Template with {placeholders} (enables --brackets).")
-    p.add_argument("--stimuli", default="data/estimulos/estimulos_completo.xlsx",
-                   help="Workbook supplying values for the template placeholders.")
+    p.add_argument("--stimuli", default="data/estimulos/items_completo.xlsx",
+                   help="Workbook supplying values for the template placeholders. "
+                        "Default columns: QUD, U, PU, I, CT, CT2, CT3, CT4, NR (plus QUD_polar). "
+                        "Use any column name as a {placeholder} in the prompt template.")
     p.add_argument("--field-map", default=None, help="JSON mapping placeholder->column, e.g. '{\"answer\":\"S2\"}'.")
     p.add_argument("--sentences", nargs="+", default=None,
                    help="Carrier mode: which column(s) fill the {sentence} slot, one prompt each: "
-                        "'all' or names like s4 p s1 (case-insensitive). Requires --template with the slot.")
+                        "'all' or names like PU I CT (case-insensitive). Requires --template with the slot.")
     p.add_argument("--sentence-slot", default="sentence", help="Placeholder name of the carrier slot.")
+    p.add_argument("--counterbalance", nargs=2, metavar=("A", "B"), default=None,
+                   help="Run two passes from one model load, swapping placeholders {A} and {B} in "
+                        "the second pass. Writes <set_name>_fwd and <set_name>_rev.")
     p.add_argument("--layers", nargs="+", default=["-1"], help="hidden_states indices; negatives / 'all' ok.")
     p.add_argument("--pooling", nargs="+", default=["whole"], choices=POOLINGS)
     p.add_argument("--brackets", nargs="+", default=None,
@@ -125,58 +138,61 @@ def last_token_indices(attention_mask):
     return seq_len - 1 - attention_mask.flip(dims=[1]).argmax(dim=1)
 
 
-def main() -> None:
-    args = parse_args()
-    poolings = list(dict.fromkeys(args.pooling))
+def swap_placeholders(text: str, a: str, b: str) -> str:
+    """Swap two placeholder names in a template, e.g. {I} <-> {PU}. Two-step swap via
+    a sentinel so the second .replace doesn't undo the first."""
+    sentinel = "\x00SWAP\x00"
+    text = text.replace("{" + a + "}", "{" + sentinel + "}")
+    text = text.replace("{" + b + "}", "{" + a + "}")
+    text = text.replace("{" + sentinel + "}", "{" + b + "}")
+    return text
 
-    import torch
-    import transformers
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    import pandas as pd
 
-    alias, hf_id, chat_default = resolve_model(args.model, args.models_config)
-    use_chat = chat_default and not args.raw
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
-
-    print(f"Loading {hf_id} ({args.dtype}, device={args.device}) ...", flush=True)
-    tok = AutoTokenizer.from_pretrained(hf_id)
-    tok.padding_side = "left"
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    if use_chat and tok.chat_template is None:
-        print("  (no chat template on this model -> falling back to --raw)")
-        use_chat = False
-
-    dtype_kw = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
-    load_kwargs = {dtype_kw: dtype}
-    if args.device == "auto":
-        load_kwargs["device_map"] = "auto"
-    model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs)
-    if args.device != "auto":
-        model.to(args.device)
-    model.eval()
-    device = next(model.parameters()).device
-
+def _build_items_for_pass(args, template_path: str | None):
+    """Build items + return (items, template_fields, carrier_mode). Stays self-contained
+    so each counterbalance pass gets its own item set built from its own template text."""
     template_fields: list[str] = []
     carrier_mode = bool(args.sentences)
-    if carrier_mode and not args.template:
+    if carrier_mode and not template_path:
         raise SystemExit("--sentences requires --template (a carrier with a {sentence} slot).")
-    if args.template:
+    if template_path:
         from core import stimuli
         field_map = json.loads(args.field_map) if args.field_map else None
         if carrier_mode:
             items, template_fields = stimuli.build_carrier_items(
-                args.template, args.stimuli, args.sentences, args.sentence_slot, field_map, args.limit)
+                template_path, args.stimuli, args.sentences, args.sentence_slot, field_map, args.limit)
         else:
-            items, template_fields = stimuli.build_items(args.template, args.stimuli, field_map, args.limit)
+            items, template_fields = stimuli.build_items(template_path, args.stimuli, field_map, args.limit)
     else:
         items = load_plain_prompts(args)
         if args.limit is not None:
             items = items[: args.limit]
+    return items, template_fields, carrier_mode
+
+
+def run_pass(
+    args,
+    *,
+    template_path: str | None,
+    set_name: str | None,
+    pass_label: str,
+    # Pre-loaded resources, shared across counterbalance passes:
+    torch, transformers, pd, model, tok, device,
+    alias: str, hf_id: str, use_chat: bool, n_states: int, layers: list[int],
+    poolings: list[str], bracket_modes: list[str],
+) -> None:
+    """One full extraction pass: build items from template_path, run model forward,
+    save to outputs/<alias>/<set_name>/. The model is NOT loaded here; caller passes it in."""
+    import math
+
+    if pass_label:
+        print(f"\n=== Pass {pass_label} → set_name={set_name} ===", flush=True)
+
+    items, template_fields, carrier_mode = _build_items_for_pass(args, template_path)
 
     bracket_fields: list[str] = []
     if args.brackets:
-        if not args.template:
+        if not template_path:
             raise SystemExit("--brackets requires --template.")
         bracket_fields = template_fields if "all" in args.brackets else args.brackets
         unknown = [f for f in bracket_fields if f not in template_fields]
@@ -188,8 +204,6 @@ def main() -> None:
     if bracket_on and not tok.is_fast:
         raise SystemExit("--brackets needs a fast tokenizer (offset mapping); this model has a slow one.")
 
-    n_states = model.config.num_hidden_layers + 1
-    layers = resolve_layers(args.layers, n_states)
     print(f"{len(items)} prompts | layers {layers} | pooling {poolings} | "
           f"brackets {bracket_fields or '-'} | chat_template={use_chat}", flush=True)
 
@@ -208,7 +222,6 @@ def main() -> None:
 
     pooled = {p: {l: [] for l in layers} for p in poolings if p in ("whole", "last")}
     tokens_all = {l: [] for l in layers} if "all" in poolings else {}
-    bracket_modes = list(dict.fromkeys(args.bracket_pooling))
     bracket_acc = {m: {f: {l: [] for l in layers} for f in bracket_fields} for m in bracket_modes}
     bracket_cnt = {f: [] for f in bracket_fields}
     tok_index_rows, meta_rows = [], []
@@ -219,7 +232,6 @@ def main() -> None:
     # input_ids in the main loop.
     idf_lookup: dict[str, "torch.Tensor"] = {}
     if "bertscore" in bracket_modes and bracket_on:
-        import math
         print("Computing IDF for bertscore pooling (one tokenizer pass) ...", flush=True)
         N = len(items)
         df_per_field: dict[str, dict[int, int]] = {f: {} for f in bracket_fields}
@@ -240,7 +252,7 @@ def main() -> None:
                 for tid in seen:
                     df_per_field[f][tid] = df_per_field[f].get(tid, 0) + 1
         vocab = model.config.vocab_size
-        idf_dtype = torch.float32  # weights are cheap; keep in fp32 for stable normalization
+        idf_dtype = torch.float32
         for f in bracket_fields:
             t = torch.zeros(vocab, dtype=idf_dtype, device=device)
             for tid, c in df_per_field[f].items():
@@ -317,11 +329,8 @@ def main() -> None:
                 if "last" in bracket_modes:
                     last_in_span = T - 1 - fmask.flip(dims=[1]).int().argmax(dim=1)
                 if "bertscore" in bracket_modes:
-                    # Per-token IDF weights for this field, zeroed outside the span.
                     idf_w = idf_lookup[field][input_ids] * fmask.to(idf_lookup[field].dtype)
                     idf_den = idf_w.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                    # If a span has zero total IDF (all tokens unseen in IDF table), fall
-                    # back to uniform within the span to avoid NaN. Marked via cnt==0 later.
                     fallback = (idf_w.sum(dim=1) == 0) & (cnt > 0)
                     if fallback.any():
                         uniform = fmask.to(idf_lookup[field].dtype)
@@ -377,17 +386,18 @@ def main() -> None:
     for field in bracket_fields:
         metadata_df[f"n_{field}"] = bracket_cnt[field]
 
-    set_name = args.set_name or (Path(args.template).stem if args.template
-                                 else Path(args.prompts).stem if args.prompts
-                                 else time.strftime("run_%Y%m%d_%H%M%S"))
-    run_dir = Path(args.output_dir) / alias / set_name
+    resolved_set_name = set_name or (Path(template_path).stem if template_path
+                                     else Path(args.prompts).stem if args.prompts
+                                     else time.strftime("run_%Y%m%d_%H%M%S"))
+    run_dir = Path(args.output_dir) / alias / resolved_set_name
     manifest = {
         "model_alias": alias, "hf_id": hf_id, "dtype": args.dtype, "device": str(device),
         "chat_template": use_chat, "max_length": args.max_length,
         "layers": layers, "n_hidden_states": n_states, "pooling": poolings,
         "brackets": bracket_fields, "bracket_pooling": bracket_modes,
-        "template": args.template, "stimuli": args.stimuli if args.template else None,
+        "template": template_path, "stimuli": args.stimuli if template_path else None,
         "sentences": args.sentences, "sentence_slot": args.sentence_slot if carrier_mode else None,
+        "counterbalance": args.counterbalance, "pass_label": pass_label or None,
         "n_prompts": len(items), "record_answer": not args.no_answer,
         "transformers": transformers.__version__, "torch": torch.__version__,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -402,6 +412,79 @@ def main() -> None:
     if tokens_all_final is not None:
         any_l = next(iter(tokens_all_final.values()))
         print(f"  tokens_all.safetensors:   {len(tokens_all_final)} layers x {any_l.shape}")
+
+
+def main() -> None:
+    args = parse_args()
+    poolings = list(dict.fromkeys(args.pooling))
+    bracket_modes = list(dict.fromkeys(args.bracket_pooling))
+
+    import torch
+    import transformers
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import pandas as pd
+
+    alias, hf_id, chat_default = resolve_model(args.model, args.models_config)
+    use_chat = chat_default and not args.raw
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
+
+    print(f"Loading {hf_id} ({args.dtype}, device={args.device}) ...", flush=True)
+    tok = AutoTokenizer.from_pretrained(hf_id)
+    tok.padding_side = "left"
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
+    if use_chat and tok.chat_template is None:
+        print("  (no chat template on this model -> falling back to --raw)")
+        use_chat = False
+
+    dtype_kw = "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+    load_kwargs = {dtype_kw: dtype}
+    if args.device == "auto":
+        load_kwargs["device_map"] = "auto"
+    model = AutoModelForCausalLM.from_pretrained(hf_id, **load_kwargs)
+    if args.device != "auto":
+        model.to(args.device)
+    model.eval()
+    device = next(model.parameters()).device
+
+    n_states = model.config.num_hidden_layers + 1
+    layers = resolve_layers(args.layers, n_states)
+
+    # Decide passes. Without --counterbalance: one pass with the original template.
+    # With --counterbalance A B: two passes. The second uses a temp template where
+    # {A} and {B} have been swapped; both passes write under <set_name>_{fwd,rev}/.
+    passes: list[tuple[str | None, str | None, str]] = []   # (template_path, set_name, pass_label)
+    if args.counterbalance:
+        a, b = args.counterbalance
+        if not args.template:
+            raise SystemExit("--counterbalance requires --template.")
+        base = args.set_name or Path(args.template).stem
+        original_text = Path(args.template).read_text(encoding="utf-8")
+        swapped_text = swap_placeholders(original_text, a, b)
+        if swapped_text == original_text:
+            raise SystemExit(f"--counterbalance {a} {b}: neither {{{a}}} nor {{{b}}} found in the template.")
+        tmp_dir = Path(tempfile.mkdtemp(prefix="extract_swap_"))
+        swapped_path = tmp_dir / f"{Path(args.template).stem}__swap_{a}_{b}.txt"
+        swapped_path.write_text(swapped_text, encoding="utf-8")
+        passes.append((args.template,        f"{base}_fwd", "fwd"))
+        passes.append((str(swapped_path),    f"{base}_rev", f"rev (swapped {{{a}}} ↔ {{{b}}})"))
+        print(f"--counterbalance enabled: 2 passes, swapping {{{a}}} ↔ {{{b}}}. "
+              f"Swapped template at {swapped_path}.")
+    else:
+        passes.append((args.template, args.set_name, ""))
+
+    for template_path, set_name, label in passes:
+        run_pass(
+            args,
+            template_path=template_path,
+            set_name=set_name,
+            pass_label=label,
+            torch=torch, transformers=transformers, pd=pd,
+            model=model, tok=tok, device=device,
+            alias=alias, hf_id=hf_id, use_chat=use_chat,
+            n_states=n_states, layers=layers,
+            poolings=poolings, bracket_modes=bracket_modes,
+        )
 
 
 if __name__ == "__main__":
